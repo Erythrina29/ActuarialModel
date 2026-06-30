@@ -1,0 +1,12 @@
+pm = data["product_mapping"].copy()
+
+print("Jumlah rows:", len(pm))
+print("Jumlah policy_number missing asli:")
+print(pm["policy_number"].isna().sum())
+
+print("Jumlah policy_number literal 'nan':")
+print((pm["policy_number"].astype(str).str.lower() == "nan").sum())
+
+print("Duplicate sample:")
+dup = pm[pm["policy_number"].duplicated(keep=False)].copy()
+print(dup[["policy_number", "Plan_Code", "Prod_Name", "Company"]].head(30))
