@@ -1,3 +1,15 @@
+import sys
+from pathlib import Path
+
+PROJECT_ROOT = Path.cwd()
+sys.path.insert(0, str(PROJECT_ROOT / "src"))
+
+from waiver_reserve.config import load_monthly_config
+from waiver_reserve.data_ingestion import load_all_raw_data
+
+config = load_monthly_config("2026-06/config/waiver_assumptions.yaml")
+data = load_all_raw_data(config, "DEBUG_PRODUCT_MAPPING")
+
 pm = data["product_mapping"].copy()
 
 print("Jumlah rows:", len(pm))
