@@ -1,15 +1,16 @@
 """
-Debug AOM Interest Rate Impact
+Debug AOM Interest Rate Impact - v2
 
 Run from project root:
     cd "C:\\Users\\mohammad.firdaus\\Documents\\pytho_warehouse\\claim_reserve\\waiver"
-    py scripts\\debug_aom_interest.py --last-month 2026-05 --this-month 2026-06
+    py scripts\\debug_aom_interest_v2.py --last-month 2026-05 --this-month 2026-06
 
 Purpose:
 1. Check last-month vs this-month RFR config.
 2. Check calculate_waiver_reserve() signature.
-3. Test whether interest_rates override changes annuity_factor and reserve.
-4. Print full traceback if TypeError/error happens.
+3. Support reserve engines that require run_id.
+4. Test whether interest_rates override changes annuity_factor and reserve.
+5. Print full traceback if error happens.
 """
 
 import argparse
@@ -20,18 +21,9 @@ from pathlib import Path
 
 
 def find_project_root() -> Path:
-    """
-    Assumption:
-    This file is placed under:
-        <project_root>/scripts/debug_aom_interest.py
-
-    If not, fallback to current working directory.
-    """
     script_path = Path(__file__).resolve()
-
     if script_path.parent.name.lower() == "scripts":
         return script_path.parent.parent
-
     return Path.cwd().resolve()
 
 
@@ -48,6 +40,67 @@ def safe_sum(df, col):
     return df[col].sum()
 
 
+def call_calculate_waiver_reserve(calc_func, data, config, scenario_name, run_id, **overrides):
+    """
+    Calls calculate_waiver_reserve() while adapting to common signatures:
+
+    1. calculate_waiver_reserve(data, config, run_id, scenario_name=...)
+    2. calculate_waiver_reserve(data, config, scenario_name=..., run_id=...)
+    3. calculate_waiver_reserve(data, config, scenario_name=...)
+
+    Also only passes override parameters if the function accepts them or accepts **kwargs.
+    """
+    sig = inspect.signature(calc_func)
+    params = sig.parameters
+    param_names = list(params.keys())
+    accepts_kwargs = any(
+        p.kind == inspect.Parameter.VAR_KEYWORD
+        for p in params.values()
+    )
+
+    kwargs = {
+        "data": data,
+        "config": config,
+    }
+
+    if "run_id" in param_names:
+        kwargs["run_id"] = run_id
+
+    if "scenario_name" in param_names:
+        kwargs["scenario_name"] = scenario_name
+    elif "scenario" in param_names:
+        kwargs["scenario"] = scenario_name
+
+    for key, value in overrides.items():
+        if key in param_names or accepts_kwargs:
+            kwargs[key] = value
+        else:
+            print(f"WARNING: calculate_waiver_reserve() does not accept override parameter: {key}")
+
+    try:
+        return calc_func(**kwargs)
+    except TypeError as e:
+        print()
+        print("Direct keyword call failed. Trying positional run_id fallback...")
+        print("Original TypeError:", str(e))
+
+        # Fallback for signature like: (data, config, run_id, ...)
+        if "run_id" in param_names:
+            fallback_kwargs = {}
+            if "scenario_name" in param_names:
+                fallback_kwargs["scenario_name"] = scenario_name
+            elif "scenario" in param_names:
+                fallback_kwargs["scenario"] = scenario_name
+
+            for key, value in overrides.items():
+                if key in param_names or accepts_kwargs:
+                    fallback_kwargs[key] = value
+
+            return calc_func(data, config, run_id, **fallback_kwargs)
+
+        raise
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--last-month", required=True, help="Example: 2026-05")
@@ -56,7 +109,6 @@ def main():
 
     project_root = find_project_root()
     src_path = project_root / "src"
-
     sys.path.insert(0, str(src_path))
 
     print_section("PROJECT PATH")
@@ -105,35 +157,22 @@ def main():
     print("LAST FX            :", config_last.get("usd_to_idr_rate"))
     print("THIS FX            :", config_this.get("usd_to_idr_rate"))
 
-    if config_last.get("interest_rate") == config_this.get("interest_rate"):
-        print()
-        print("WARNING: LAST and THIS interest_rate are identical after config loading.")
-        print("If interest impact is zero, that would be expected.")
-    else:
-        print()
-        print("OK: LAST and THIS interest_rate are different after config loading.")
-
     print_section("RESERVE ENGINE SIGNATURE")
     sig = inspect.signature(calculate_waiver_reserve)
     print("calculate_waiver_reserve signature:")
     print(sig)
-
     parameter_names = list(sig.parameters.keys())
     print("parameters:", parameter_names)
 
     if "interest_rates" not in parameter_names:
         print()
-        print("PROBLEM FOUND:")
-        print("calculate_waiver_reserve() does NOT accept parameter 'interest_rates'.")
-        print("AOM cannot isolate interest rate impact until reserve_engine.py is updated.")
-        print()
-        print("Expected signature should include:")
-        print("    interest_rates=None, usd_to_idr_rate=None, valuation_date=None")
-        raise SystemExit(2)
+        print("WARNING:")
+        print("calculate_waiver_reserve() does NOT explicitly accept parameter 'interest_rates'.")
+        print("If it does not accept **kwargs either, the interest override cannot work.")
 
     print_section("LOAD LAST MONTH DATA")
     try:
-        data_last = load_all_raw_data(config_last, "DEBUG_AOM_INTEREST")
+        data_last = load_all_raw_data(config_last, "DEBUG_AOM_INTEREST_V2")
     except Exception as e:
         print("ERROR TYPE   :", type(e).__name__)
         print("ERROR MESSAGE:", str(e))
@@ -142,7 +181,6 @@ def main():
         raise SystemExit(1)
 
     print("Loaded data keys:", list(data_last.keys()))
-
     for key in ["masterpolis", "product_mapping", "urlsbinf", "crlsrinf", "waiver_dates", "mortality_table"]:
         if key in data_last:
             print(f"{key:20s}: rows={len(data_last[key])}, cols={len(data_last[key].columns)}")
@@ -151,10 +189,12 @@ def main():
 
     print_section("RUN SCENARIO: RESERVE LAST MONTH")
     try:
-        reserve_last = calculate_waiver_reserve(
+        reserve_last = call_calculate_waiver_reserve(
+            calculate_waiver_reserve,
             data=data_last,
             config=config_last,
             scenario_name="reserve_last_month",
+            run_id="DEBUG_RESERVE_LAST_MONTH",
         )
     except Exception as e:
         print("ERROR TYPE   :", type(e).__name__)
@@ -164,7 +204,6 @@ def main():
         raise SystemExit(1)
 
     print("reserve_last rows:", len(reserve_last))
-    print("reserve_last columns:", list(reserve_last.columns))
     print("reserve_last total:", safe_sum(reserve_last, "waiver_reserve_idr"))
 
     if "Currency" in reserve_last.columns and "waiver_reserve_idr" in reserve_last.columns:
@@ -178,11 +217,13 @@ def main():
 
     print_section("RUN SCENARIO: RESERVE AFTER INTEREST")
     try:
-        reserve_after_interest = calculate_waiver_reserve(
+        reserve_after_interest = call_calculate_waiver_reserve(
+            calculate_waiver_reserve,
             data=data_last,
             config=config_last,
             scenario_name="reserve_after_interest_rate",
-            interest_rates=config_this["interest_rate"],
+            run_id="DEBUG_RESERVE_AFTER_INTEREST",
+            interest_rates=config_this.get("interest_rate"),
         )
     except Exception as e:
         print("ERROR TYPE   :", type(e).__name__)
@@ -204,7 +245,6 @@ def main():
             print(f"{col}: {reserve_after_interest[col].drop_duplicates().head(10).tolist()}")
 
     print_section("COMPARE LAST VS AFTER INTEREST")
-
     required_cols = ["policy_number", "waiver_reserve_idr"]
     missing_last = [c for c in required_cols if c not in reserve_last.columns]
     missing_after = [c for c in required_cols if c not in reserve_after_interest.columns]
@@ -232,16 +272,10 @@ def main():
         suffixes=("_last", "_after_interest"),
     )
 
-    debug["reserve_diff"] = (
-        debug["waiver_reserve_idr_after_interest"]
-        - debug["waiver_reserve_idr_last"]
-    )
+    debug["reserve_diff"] = debug["waiver_reserve_idr_after_interest"] - debug["waiver_reserve_idr_last"]
 
     if "annuity_factor_last" in debug.columns and "annuity_factor_after_interest" in debug.columns:
-        debug["annuity_factor_diff"] = (
-            debug["annuity_factor_after_interest"]
-            - debug["annuity_factor_last"]
-        )
+        debug["annuity_factor_diff"] = debug["annuity_factor_after_interest"] - debug["annuity_factor_last"]
     else:
         debug["annuity_factor_diff"] = 0
 
@@ -249,6 +283,7 @@ def main():
     print("total reserve last          :", debug["waiver_reserve_idr_last"].sum())
     print("total reserve after interest:", debug["waiver_reserve_idr_after_interest"].sum())
     print("total interest impact       :", debug["reserve_diff"].sum())
+    print("total absolute impact       :", debug["reserve_diff"].abs().sum())
     print("total annuity factor diff   :", debug["annuity_factor_diff"].sum())
 
     currency_col = None
@@ -260,14 +295,9 @@ def main():
     if currency_col is not None:
         print()
         print("Impact by Currency:")
-        print(
-            debug.groupby(currency_col)[["reserve_diff", "annuity_factor_diff"]]
-            .sum()
-            .sort_index()
-        )
+        print(debug.groupby(currency_col)[["reserve_diff", "annuity_factor_diff"]].sum().sort_index())
 
     non_zero = debug[debug["reserve_diff"].abs() > 0.01].copy()
-
     print()
     print("non-zero reserve_diff rows:", len(non_zero))
 
