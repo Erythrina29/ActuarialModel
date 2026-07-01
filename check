@@ -5,20 +5,15 @@ PROJECT_ROOT = Path.cwd()
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from waiver_reserve.config import load_monthly_config
-from waiver_reserve.data_ingestion import load_all_raw_data
 
-config = load_monthly_config("2026-05/config/waiver_assumptions.yaml")
-data = load_all_raw_data(config, "DEBUG_PRODUCT_MAPPING")
+config_last = load_monthly_config("2026-05/config/waiver_assumptions.yaml")
+config_this = load_monthly_config("2026-06/config/waiver_assumptions.yaml")
 
-pm = data["product_mapping"].copy()
+print("LAST valuation_date:", config_last["valuation_date"])
+print("THIS valuation_date:", config_this["valuation_date"])
 
-print("Jumlah rows:", len(pm))
-print("Jumlah policy_number missing asli:")
-print(pm["policy_number"].isna().sum())
+print("LAST interest_rate:", config_last.get("interest_rate"))
+print("THIS interest_rate:", config_this.get("interest_rate"))
 
-print("Jumlah policy_number literal 'nan':")
-print((pm["policy_number"].astype(str).str.lower() == "nan").sum())
-
-print("Duplicate sample:")
-dup = pm[pm["policy_number"].duplicated(keep=False)].copy()
-print(dup[["policy_number", "Plan_Code", "Prod_Name", "Company"]].head(30))
+print("LAST FX:", config_last.get("usd_to_idr_rate"))
+print("THIS FX:", config_this.get("usd_to_idr_rate"))
