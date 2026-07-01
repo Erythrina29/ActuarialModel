@@ -1,352 +1,236 @@
-"""
-Debug AOM Interest Rate Impact - v2
-
-Run from project root:
-    cd "C:\\Users\\mohammad.firdaus\\Documents\\pytho_warehouse\\claim_reserve\\waiver"
-    py scripts\\debug_aom_interest_v2.py --last-month 2026-05 --this-month 2026-06
-
-Purpose:
-1. Check last-month vs this-month RFR config.
-2. Check calculate_waiver_reserve() signature.
-3. Support reserve engines that require run_id.
-4. Test whether interest_rates override changes annuity_factor and reserve.
-5. Print full traceback if error happens.
-"""
-
-import argparse
-import inspect
-import sys
-import traceback
-from pathlib import Path
-
-
-def find_project_root() -> Path:
-    script_path = Path(__file__).resolve()
-    if script_path.parent.name.lower() == "scripts":
-        return script_path.parent.parent
-    return Path.cwd().resolve()
-
-
-def print_section(title: str) -> None:
-    print()
-    print("=" * 100)
-    print(title)
-    print("=" * 100)
-
-
-def safe_sum(df, col):
-    if col not in df.columns:
-        return None
-    return df[col].sum()
-
-
-def call_calculate_waiver_reserve(calc_func, data, config, scenario_name, run_id, **overrides):
+def calculate_annuity_factor(df, mortality_table, config, yield_curve=None):
     """
-    Calls calculate_waiver_reserve() while adapting to common signatures:
+    Calculate waiver annuity factor.
 
-    1. calculate_waiver_reserve(data, config, run_id, scenario_name=...)
-    2. calculate_waiver_reserve(data, config, scenario_name=..., run_id=...)
-    3. calculate_waiver_reserve(data, config, scenario_name=...)
-
-    Also only passes override parameters if the function accepts them or accepts **kwargs.
+    Key governance points:
+    1. Currency must already exist in the model point.
+    2. Currency is normalized before RFR lookup.
+    3. interest_rate config keys are normalized before lookup.
+    4. No silent fallback to i = 0.05.
+    5. Existing annuity timing is preserved first: annuity += surv * (v ** k).
     """
-    sig = inspect.signature(calc_func)
-    params = sig.parameters
-    param_names = list(params.keys())
-    accepts_kwargs = any(
-        p.kind == inspect.Parameter.VAR_KEYWORD
-        for p in params.values()
+
+    basis = str(config.get("basis", "Local")).strip()
+
+    if basis != "Local":
+        raise NotImplementedError(
+            "calculate_annuity_factor() saat ini hanya diaktifkan untuk basis Local. "
+            "Basis selain Local perlu dicek terpisah agar tidak salah memakai yield curve."
+        )
+
+    result = df.copy()
+
+    if "Currency" not in result.columns:
+        raise ValueError(
+            "Column 'Currency' tidak ditemukan di model point. "
+            "Untuk waiver reserve ini, Currency tidak boleh di-derive dari PROD_CODE."
+        )
+
+    result["Currency"] = result["Currency"].apply(normalize_currency)
+
+    invalid_currency = result[
+        result["Currency"].isna()
+        | ~result["Currency"].isin(["IDR", "USD"])
+    ].copy()
+
+    if len(invalid_currency) > 0:
+        sample_cols = [
+            col
+            for col in ["policy_number", "Currency"]
+            if col in invalid_currency.columns
+        ]
+
+        raise ValueError(
+            "Ada Currency yang tidak valid sebelum annuity calculation. "
+            f"Jumlah rows: {len(invalid_currency):,}. "
+            f"Sample: {invalid_currency[sample_cols].head(20).to_dict('records')}"
+        )
+
+    interest_rates_raw = config.get("interest_rate")
+
+    if interest_rates_raw is None:
+        raise ValueError(
+            "Config tidak punya key 'interest_rate'. "
+            "Pastikan YAML berisi interest_rate dengan key IDR dan USD."
+        )
+
+    interest_rates = {}
+
+    for key, value in interest_rates_raw.items():
+        normalized_key = normalize_currency(key)
+
+        if pd.isna(normalized_key):
+            continue
+
+        try:
+            interest_rates[normalized_key] = float(value)
+        except Exception as exc:
+            raise ValueError(
+                f"Interest rate untuk key '{key}' tidak bisa dikonversi menjadi angka. "
+                f"Value aktual: {value}"
+            ) from exc
+
+    missing_rate_keys = {"IDR", "USD"} - set(interest_rates.keys())
+
+    if missing_rate_keys:
+        raise ValueError(
+            f"interest_rate config belum lengkap. Missing keys: {missing_rate_keys}. "
+            f"Available keys after normalization: {list(interest_rates.keys())}"
+        )
+
+    mortality_table = mortality_table.copy()
+
+    if "Age" not in mortality_table.columns:
+        raise ValueError(
+            "Mortality table tidak punya column 'Age'."
+        )
+
+    mortality_table["Age"] = pd.to_numeric(
+        mortality_table["Age"],
+        errors="coerce",
     )
 
-    kwargs = {
-        "data": data,
-        "config": config,
-    }
+    required_mortality_cols = ["MNSQ[x]", "FNSQ[x]"]
 
-    if "run_id" in param_names:
-        kwargs["run_id"] = run_id
+    missing_mortality_cols = [
+        col
+        for col in required_mortality_cols
+        if col not in mortality_table.columns
+    ]
 
-    if "scenario_name" in param_names:
-        kwargs["scenario_name"] = scenario_name
-    elif "scenario" in param_names:
-        kwargs["scenario"] = scenario_name
-
-    for key, value in overrides.items():
-        if key in param_names or accepts_kwargs:
-            kwargs[key] = value
-        else:
-            print(f"WARNING: calculate_waiver_reserve() does not accept override parameter: {key}")
-
-    try:
-        return calc_func(**kwargs)
-    except TypeError as e:
-        print()
-        print("Direct keyword call failed. Trying positional run_id fallback...")
-        print("Original TypeError:", str(e))
-
-        # Fallback for signature like: (data, config, run_id, ...)
-        if "run_id" in param_names:
-            fallback_kwargs = {}
-            if "scenario_name" in param_names:
-                fallback_kwargs["scenario_name"] = scenario_name
-            elif "scenario" in param_names:
-                fallback_kwargs["scenario"] = scenario_name
-
-            for key, value in overrides.items():
-                if key in param_names or accepts_kwargs:
-                    fallback_kwargs[key] = value
-
-            return calc_func(data, config, run_id, **fallback_kwargs)
-
-        raise
-
-
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--last-month", required=True, help="Example: 2026-05")
-    parser.add_argument("--this-month", required=True, help="Example: 2026-06")
-    args = parser.parse_args()
-
-    project_root = find_project_root()
-    src_path = project_root / "src"
-    sys.path.insert(0, str(src_path))
-
-    print_section("PROJECT PATH")
-    print("project_root:", project_root)
-    print("src_path     :", src_path)
-    print("python exe   :", sys.executable)
-    print("python ver   :", sys.version)
-
-    try:
-        from waiver_reserve.config import load_monthly_config
-        from waiver_reserve.data_ingestion import load_all_raw_data
-        from waiver_reserve.reserve_engine import calculate_waiver_reserve
-    except Exception as e:
-        print_section("IMPORT ERROR")
-        print("ERROR TYPE   :", type(e).__name__)
-        print("ERROR MESSAGE:", str(e))
-        print("FULL TRACEBACK:")
-        traceback.print_exc()
-        raise SystemExit(1)
-
-    last_config_path = project_root / args.last_month / "config" / "waiver_assumptions.yaml"
-    this_config_path = project_root / args.this_month / "config" / "waiver_assumptions.yaml"
-
-    print_section("CONFIG PATHS")
-    print("last_config_path:", last_config_path)
-    print("this_config_path:", this_config_path)
-    print("last exists     :", last_config_path.exists())
-    print("this exists     :", this_config_path.exists())
-
-    try:
-        config_last = load_monthly_config(str(last_config_path))
-        config_this = load_monthly_config(str(this_config_path))
-    except Exception as e:
-        print_section("CONFIG LOAD ERROR")
-        print("ERROR TYPE   :", type(e).__name__)
-        print("ERROR MESSAGE:", str(e))
-        print("FULL TRACEBACK:")
-        traceback.print_exc()
-        raise SystemExit(1)
-
-    print_section("CONFIG VALUES")
-    print("LAST valuation_date:", config_last.get("valuation_date"))
-    print("THIS valuation_date:", config_this.get("valuation_date"))
-    print("LAST interest_rate :", config_last.get("interest_rate"))
-    print("THIS interest_rate :", config_this.get("interest_rate"))
-    print("LAST FX            :", config_last.get("usd_to_idr_rate"))
-    print("THIS FX            :", config_this.get("usd_to_idr_rate"))
-
-    print_section("RESERVE ENGINE SIGNATURE")
-    sig = inspect.signature(calculate_waiver_reserve)
-    print("calculate_waiver_reserve signature:")
-    print(sig)
-    parameter_names = list(sig.parameters.keys())
-    print("parameters:", parameter_names)
-
-    if "interest_rates" not in parameter_names:
-        print()
-        print("WARNING:")
-        print("calculate_waiver_reserve() does NOT explicitly accept parameter 'interest_rates'.")
-        print("If it does not accept **kwargs either, the interest override cannot work.")
-
-    print_section("LOAD LAST MONTH DATA")
-    try:
-        data_last = load_all_raw_data(config_last, "DEBUG_AOM_INTEREST_V2")
-    except Exception as e:
-        print("ERROR TYPE   :", type(e).__name__)
-        print("ERROR MESSAGE:", str(e))
-        print("FULL TRACEBACK:")
-        traceback.print_exc()
-        raise SystemExit(1)
-
-    print("Loaded data keys:", list(data_last.keys()))
-    for key in ["masterpolis", "product_mapping", "urlsbinf", "crlsrinf", "waiver_dates", "mortality_table"]:
-        if key in data_last:
-            print(f"{key:20s}: rows={len(data_last[key])}, cols={len(data_last[key].columns)}")
-        else:
-            print(f"{key:20s}: MISSING")
-
-    print_section("RUN SCENARIO: RESERVE LAST MONTH")
-    try:
-        reserve_last = call_calculate_waiver_reserve(
-            calculate_waiver_reserve,
-            data=data_last,
-            config=config_last,
-            scenario_name="reserve_last_month",
-            run_id="DEBUG_RESERVE_LAST_MONTH",
+    if missing_mortality_cols:
+        raise ValueError(
+            f"Mortality table missing columns: {missing_mortality_cols}"
         )
-    except Exception as e:
-        print("ERROR TYPE   :", type(e).__name__)
-        print("ERROR MESSAGE:", str(e))
-        print("FULL TRACEBACK:")
-        traceback.print_exc()
-        raise SystemExit(1)
 
-    print("reserve_last rows:", len(reserve_last))
-    print("reserve_last total:", safe_sum(reserve_last, "waiver_reserve_idr"))
+    sex_column_candidates = [
+        "Sex",
+        "SEX",
+        "Insured_Sex",
+        "INSURED_SEX",
+        "Gender",
+        "GENDER",
+    ]
 
-    if "Currency" in reserve_last.columns and "waiver_reserve_idr" in reserve_last.columns:
-        print()
-        print("reserve_last by Currency:")
-        print(reserve_last.groupby("Currency")["waiver_reserve_idr"].sum())
+    sex_column = None
 
-    for col in ["interest_rate_idr_used", "interest_rate_usd_used", "usd_to_idr_rate_used", "valuation_date_used"]:
-        if col in reserve_last.columns:
-            print(f"{col}: {reserve_last[col].drop_duplicates().head(10).tolist()}")
+    for col in sex_column_candidates:
+        if col in result.columns:
+            sex_column = col
+            break
 
-    print_section("RUN SCENARIO: RESERVE AFTER INTEREST")
-    try:
-        reserve_after_interest = call_calculate_waiver_reserve(
-            calculate_waiver_reserve,
-            data=data_last,
-            config=config_last,
-            scenario_name="reserve_after_interest_rate",
-            run_id="DEBUG_RESERVE_AFTER_INTEREST",
-            interest_rates=config_this.get("interest_rate"),
+    if sex_column is None:
+        raise ValueError(
+            "Tidak ditemukan column sex/gender di model point. "
+            f"Expected salah satu dari: {sex_column_candidates}"
         )
-    except Exception as e:
-        print("ERROR TYPE   :", type(e).__name__)
-        print("ERROR MESSAGE:", str(e))
-        print("FULL TRACEBACK:")
-        traceback.print_exc()
-        raise SystemExit(1)
 
-    print("reserve_after_interest rows:", len(reserve_after_interest))
-    print("reserve_after_interest total:", safe_sum(reserve_after_interest, "waiver_reserve_idr"))
+    required_model_cols = [
+        "current_age_at_val",
+        "remaining_waiver_years",
+        "Currency",
+        sex_column,
+    ]
 
-    if "Currency" in reserve_after_interest.columns and "waiver_reserve_idr" in reserve_after_interest.columns:
-        print()
-        print("reserve_after_interest by Currency:")
-        print(reserve_after_interest.groupby("Currency")["waiver_reserve_idr"].sum())
+    missing_model_cols = [
+        col
+        for col in required_model_cols
+        if col not in result.columns
+    ]
 
-    for col in ["interest_rate_idr_used", "interest_rate_usd_used", "usd_to_idr_rate_used", "valuation_date_used"]:
-        if col in reserve_after_interest.columns:
-            print(f"{col}: {reserve_after_interest[col].drop_duplicates().head(10).tolist()}")
+    if missing_model_cols:
+        raise ValueError(
+            f"Model point missing columns untuk annuity calculation: {missing_model_cols}"
+        )
 
-    print_section("COMPARE LAST VS AFTER INTEREST")
-    required_cols = ["policy_number", "waiver_reserve_idr"]
-    missing_last = [c for c in required_cols if c not in reserve_last.columns]
-    missing_after = [c for c in required_cols if c not in reserve_after_interest.columns]
+    def get_annuity(row):
+        age = row["current_age_at_val"]
+        remaining = row["remaining_waiver_years"]
+        sex = str(row[sex_column]).strip().upper()
+        currency = normalize_currency(row["Currency"])
 
-    if missing_last or missing_after:
-        print("Cannot compare because required columns are missing.")
-        print("missing in reserve_last:", missing_last)
-        print("missing in reserve_after_interest:", missing_after)
-        raise SystemExit(3)
+        if pd.isna(age):
+            raise ValueError(
+                f"current_age_at_val kosong untuk policy_number={row.get('policy_number')}"
+            )
 
-    left_cols = ["policy_number", "waiver_reserve_idr"]
-    right_cols = ["policy_number", "waiver_reserve_idr"]
+        if pd.isna(remaining):
+            raise ValueError(
+                f"remaining_waiver_years kosong untuk policy_number={row.get('policy_number')}"
+            )
 
-    optional_cols = ["Currency", "annuity_factor", "annual_premium_waived"]
-    for col in optional_cols:
-        if col in reserve_last.columns:
-            left_cols.append(col)
-        if col in reserve_after_interest.columns:
-            right_cols.append(col)
+        if pd.isna(currency):
+            raise ValueError(
+                f"Currency kosong untuk policy_number={row.get('policy_number')}"
+            )
 
-    debug = reserve_last[left_cols].merge(
-        reserve_after_interest[right_cols],
-        on="policy_number",
-        how="inner",
-        suffixes=("_last", "_after_interest"),
+        if currency not in interest_rates:
+            raise ValueError(
+                f"Currency '{currency}' tidak ditemukan di interest_rate config. "
+                f"Available keys: {list(interest_rates.keys())}. "
+                f"policy_number={row.get('policy_number')}"
+            )
+
+        age = float(age)
+        remaining = int(remaining)
+
+        if remaining <= 0:
+            return 0.0
+
+        i = interest_rates[currency]
+        v = 1 / (1 + i)
+
+        if sex in ["M", "MALE", "L", "LAKI-LAKI", "LAKILAKI"]:
+            q_col = "MNSQ[x]"
+        elif sex in ["F", "FEMALE", "P", "PEREMPUAN", "WANITA"]:
+            q_col = "FNSQ[x]"
+        else:
+            raise ValueError(
+                f"Sex/Gender tidak valid: '{sex}' "
+                f"untuk policy_number={row.get('policy_number')}"
+            )
+
+        surv = 1.0
+        annuity = 0.0
+
+        for k in range(remaining):
+            # Keep existing annuity timing first.
+            # Do not change to v ** (k + 1) until RFR lookup is fully validated.
+            annuity += surv * (v ** k)
+
+            current_age = int(round(age + k))
+
+            q_row = mortality_table[
+                mortality_table["Age"] == current_age
+            ]
+
+            if len(q_row) > 0:
+                q = q_row.iloc[0][q_col]
+            else:
+                q = 0.01
+
+            q = float(q)
+
+            if q < 0 or q > 1:
+                raise ValueError(
+                    f"Invalid qx={q} untuk age={current_age}, q_col={q_col}, "
+                    f"policy_number={row.get('policy_number')}"
+                )
+
+            surv *= 1 - q
+
+        return annuity
+
+    result["annuity_factor"] = result.apply(get_annuity, axis=1)
+
+    logger.info(
+        "Annuity factor calculated using Local basis. Interest rates used: %s",
+        interest_rates,
     )
 
-    debug["reserve_diff"] = debug["waiver_reserve_idr_after_interest"] - debug["waiver_reserve_idr_last"]
+    logger.info(
+        "Currency distribution in annuity calculation: %s",
+        result["Currency"].value_counts(dropna=False).to_dict(),
+    )
 
-    if "annuity_factor_last" in debug.columns and "annuity_factor_after_interest" in debug.columns:
-        debug["annuity_factor_diff"] = debug["annuity_factor_after_interest"] - debug["annuity_factor_last"]
-    else:
-        debug["annuity_factor_diff"] = 0
-
-    print("merged rows:", len(debug))
-    print("total reserve last          :", debug["waiver_reserve_idr_last"].sum())
-    print("total reserve after interest:", debug["waiver_reserve_idr_after_interest"].sum())
-    print("total interest impact       :", debug["reserve_diff"].sum())
-    print("total absolute impact       :", debug["reserve_diff"].abs().sum())
-    print("total annuity factor diff   :", debug["annuity_factor_diff"].sum())
-
-    currency_col = None
-    if "Currency_last" in debug.columns:
-        currency_col = "Currency_last"
-    elif "Currency_after_interest" in debug.columns:
-        currency_col = "Currency_after_interest"
-
-    if currency_col is not None:
-        print()
-        print("Impact by Currency:")
-        print(debug.groupby(currency_col)[["reserve_diff", "annuity_factor_diff"]].sum().sort_index())
-
-    non_zero = debug[debug["reserve_diff"].abs() > 0.01].copy()
-    print()
-    print("non-zero reserve_diff rows:", len(non_zero))
-
-    print()
-    print("Sample non-zero rows:")
-    sample_cols = ["policy_number", "reserve_diff"]
-    for c in [
-        "Currency_last",
-        "Currency_after_interest",
-        "annuity_factor_last",
-        "annuity_factor_after_interest",
-        "annuity_factor_diff",
-        "waiver_reserve_idr_last",
-        "waiver_reserve_idr_after_interest",
-        "annual_premium_waived_last",
-        "annual_premium_waived_after_interest",
-    ]:
-        if c in debug.columns:
-            sample_cols.append(c)
-
-    if len(non_zero) > 0:
-        print(non_zero[sample_cols].head(30).to_string(index=False))
-    else:
-        print("No non-zero interest impact detected.")
-
-    print_section("DIAGNOSIS")
-    total_abs_impact = debug["reserve_diff"].abs().sum()
-
-    if total_abs_impact == 0:
-        print("RESULT: Interest override did NOT change reserve at policy level.")
-        print()
-        print("Most likely causes:")
-        print("1. reserve_engine.py receives interest_rates but does not pass scenario_config to calculate_annuity_factor().")
-        print("2. model.py reads the wrong config key, e.g. 'interest_rates' instead of 'interest_rate'.")
-        print("3. model.py ignores config interest_rate and uses a hardcoded/default rate.")
-        print("4. Currency values do not match interest rate keys and code silently falls back to default rate.")
-        print()
-        print("Next file to inspect: src/waiver_reserve/reserve_engine.py and src/waiver_reserve/model.py")
-    else:
-        print("RESULT: Interest override DOES change reserve at policy level.")
-        print()
-        print("Therefore if AOM output still shows interest_rate_impact = 0,")
-        print("the bug is likely in aom.py movement formula, scenario merge, or summary aggregation.")
-        print()
-        print("Next file to inspect: src/waiver_reserve/aom.py")
-
-    print()
-    print("Debug completed.")
-
-
-if __name__ == "__main__":
-    main()
+    return result
