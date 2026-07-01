@@ -5,15 +5,73 @@ PROJECT_ROOT = Path.cwd()
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
 from waiver_reserve.config import load_monthly_config
+from waiver_reserve.data_ingestion import load_all_raw_data
+from waiver_reserve.reserve_engine import calculate_waiver_reserve
 
 config_last = load_monthly_config("2026-05/config/waiver_assumptions.yaml")
 config_this = load_monthly_config("2026-06/config/waiver_assumptions.yaml")
 
-print("LAST valuation_date:", config_last["valuation_date"])
-print("THIS valuation_date:", config_this["valuation_date"])
+data_last = load_all_raw_data(config_last, "DEBUG_INTEREST_OVERRIDE")
 
-print("LAST interest_rate:", config_last.get("interest_rate"))
-print("THIS interest_rate:", config_this.get("interest_rate"))
+reserve_last = calculate_waiver_reserve(
+    data=data_last,
+    config=config_last,
+    scenario_name="reserve_last_month",
+)
 
-print("LAST FX:", config_last.get("usd_to_idr_rate"))
-print("THIS FX:", config_this.get("usd_to_idr_rate"))
+reserve_after_interest = calculate_waiver_reserve(
+    data=data_last,
+    config=config_last,
+    scenario_name="reserve_after_interest_rate",
+    interest_rates=config_this["interest_rate"],
+)
+
+print("LAST RFR:", config_last["interest_rate"])
+print("THIS RFR:", config_this["interest_rate"])
+
+print("Reserve last:")
+print(reserve_last.groupby("Currency")["waiver_reserve_idr"].sum())
+
+print("Reserve after interest:")
+print(reserve_after_interest.groupby("Currency")["waiver_reserve_idr"].sum())
+
+debug = reserve_last[
+    ["policy_number", "Currency", "annuity_factor", "waiver_reserve_idr"]
+].merge(
+    reserve_after_interest[
+        ["policy_number", "Currency", "annuity_factor", "waiver_reserve_idr"]
+    ],
+    on="policy_number",
+    how="inner",
+    suffixes=("_last", "_after_interest"),
+)
+
+debug["annuity_factor_diff"] = (
+    debug["annuity_factor_after_interest"] - debug["annuity_factor_last"]
+)
+
+debug["reserve_diff"] = (
+    debug["waiver_reserve_idr_after_interest"] - debug["waiver_reserve_idr_last"]
+)
+
+print("Impact by currency:")
+print(
+    debug.groupby("Currency_last")[["annuity_factor_diff", "reserve_diff"]]
+    .sum()
+)
+
+print("Sample non-zero impact:")
+print(
+    debug[debug["reserve_diff"].abs() > 0.01][
+        [
+            "policy_number",
+            "Currency_last",
+            "annuity_factor_last",
+            "annuity_factor_after_interest",
+            "annuity_factor_diff",
+            "waiver_reserve_idr_last",
+            "waiver_reserve_idr_after_interest",
+            "reserve_diff",
+        ]
+    ].head(20)
+)
