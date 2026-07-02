@@ -1,322 +1,475 @@
 """
-Debug AOM Interest Rate Impact
+BOTTOM SECTION: Analysis of Movement for Waiver Reserve.
 
-Run from project root:
-    cd "C:\\Users\\mohammad.firdaus\\Documents\\pytho_warehouse\\claim_reserve\\waiver"
-    py scripts\\debug_aom_interest.py --last-month 2026-05 --this-month 2026-06
-
-Purpose:
-1. Check last-month vs this-month RFR config.
-2. Check calculate_waiver_reserve() signature.
-3. Test whether interest_rates override changes annuity_factor and reserve.
-4. Print full traceback if TypeError/error happens.
+AOM bridge order:
+1. Reserve Last Month
+2. Interest Rate Impact
+3. FX Rate Impact
+4. Aging Impact
+5. Natural Impact - New Policies
+6. Natural Impact - Terminated Policies
+7. Natural Impact - Continuing Policies
+8. Reserve This Month
 """
 
-import argparse
-import inspect
-import sys
-import traceback
+from __future__ import annotations
+
+import logging
+from datetime import datetime
 from pathlib import Path
+from typing import Any, Dict, Optional
+
+import pandas as pd
+
+from waiver_reserve.config import load_monthly_config
+from waiver_reserve.data_ingestion import load_all_raw_data
+from waiver_reserve.export import export_excel
+from waiver_reserve.logging_utils import setup_logging
+from waiver_reserve.reconciliation import assert_max_abs_column, summarize_numeric_columns
+from waiver_reserve.reserve_engine import calculate_waiver_reserve
+
+logger = logging.getLogger("waiver_reserve.aom")
+
+PRODUCT_DIMENSIONS = ["Company", "Prod_Name", "Plan_Code"]
+
+SCENARIO_COLUMN_MAP = {
+    "reserve_last_month": "reserve_last_month",
+    "reserve_after_interest_rate": "reserve_after_interest_rate",
+    "reserve_after_fx_rate": "reserve_after_fx_rate",
+    "reserve_after_aging": "reserve_after_aging",
+    "reserve_this_month": "reserve_this_month",
+}
 
 
-def find_project_root() -> Path:
+def make_run_id(process_name: str, valuation_month: str) -> str:
+    """Create deterministic-readable run id."""
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return f"{process_name}_{valuation_month}_{timestamp}"
+
+
+def _scenario_to_policy_reserve(df: pd.DataFrame, reserve_col_name: str) -> pd.DataFrame:
+    """Return one row per policy with reserve for a scenario."""
+    if df.empty:
+        return pd.DataFrame(columns=["policy_number", reserve_col_name, f"has_{reserve_col_name}"])
+
+    out = df[["policy_number", "waiver_reserve_idr"]].copy()
+    out = out.groupby("policy_number", as_index=False)["waiver_reserve_idr"].sum()
+    out = out.rename(columns={"waiver_reserve_idr": reserve_col_name})
+    out[f"has_{reserve_col_name}"] = True
+    return out
+
+
+def _extract_policy_dimensions(df: pd.DataFrame, source_priority: int) -> pd.DataFrame:
     """
-    Assumption:
-    This file is placed under:
-        <project_root>/scripts/debug_aom_interest.py
+    Extract product dimensions from a reserve scenario.
 
-    If not, fallback to current working directory.
+    AOM dimension convention:
+    - Use closing-month dimensions first for policies existing this month.
+    - Fallback to aged/last-month dimensions for ended policies.
     """
-    script_path = Path(__file__).resolve()
+    required_cols = ["policy_number"] + PRODUCT_DIMENSIONS
+    if df.empty or not all(col in df.columns for col in required_cols):
+        return pd.DataFrame(columns=required_cols + ["dimension_priority"])
 
-    if script_path.parent.name.lower() == "scripts":
-        return script_path.parent.parent
-
-    return Path.cwd().resolve()
-
-
-def print_section(title: str) -> None:
-    print()
-    print("=" * 100)
-    print(title)
-    print("=" * 100)
+    dims = df[required_cols].copy()
+    dims = dims.drop_duplicates("policy_number", keep="last")
+    dims["dimension_priority"] = source_priority
+    return dims
 
 
-def safe_sum(df, col):
-    if col not in df.columns:
-        return None
-    return df[col].sum()
+def _build_policy_dimensions(scenario_outputs: Dict[str, pd.DataFrame]) -> pd.DataFrame:
+    """Build one dimension row per policy using scenario priority."""
+    priority_order = [
+        "reserve_this_month",
+        "reserve_after_aging",
+        "reserve_after_fx_rate",
+        "reserve_after_interest_rate",
+        "reserve_last_month",
+    ]
+
+    pieces = []
+    for priority, scenario_name in enumerate(priority_order):
+        if scenario_name in scenario_outputs:
+            pieces.append(_extract_policy_dimensions(scenario_outputs[scenario_name], priority))
+
+    if not pieces:
+        return pd.DataFrame(columns=["policy_number"] + PRODUCT_DIMENSIONS)
+
+    dims = pd.concat(pieces, ignore_index=True)
+    if dims.empty:
+        return pd.DataFrame(columns=["policy_number"] + PRODUCT_DIMENSIONS)
+
+    dims = dims.sort_values(["policy_number", "dimension_priority"])
+    dims = dims.drop_duplicates("policy_number", keep="first")
+    dims = dims[["policy_number"] + PRODUCT_DIMENSIONS].copy()
+
+    for col in PRODUCT_DIMENSIONS:
+        dims[col] = dims[col].fillna("UNMAPPED").astype(str).str.strip()
+        dims.loc[dims[col].eq(""), col] = "UNMAPPED"
+
+    return dims
 
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--last-month", required=True, help="Example: 2026-05")
-    parser.add_argument("--this-month", required=True, help="Example: 2026-06")
-    args = parser.parse_args()
+def _merge_scenarios(scenario_outputs: Dict[str, pd.DataFrame]) -> pd.DataFrame:
+    """Outer-merge reserve outputs from all bridge scenarios."""
+    merged: Optional[pd.DataFrame] = None
 
-    project_root = find_project_root()
-    src_path = project_root / "src"
-
-    sys.path.insert(0, str(src_path))
-
-    print_section("PROJECT PATH")
-    print("project_root:", project_root)
-    print("src_path     :", src_path)
-    print("python exe   :", sys.executable)
-    print("python ver   :", sys.version)
-
-    try:
-        from waiver_reserve.config import load_monthly_config
-        from waiver_reserve.data_ingestion import load_all_raw_data
-        from waiver_reserve.reserve_engine import calculate_waiver_reserve
-    except Exception as e:
-        print_section("IMPORT ERROR")
-        print("ERROR TYPE   :", type(e).__name__)
-        print("ERROR MESSAGE:", str(e))
-        print("FULL TRACEBACK:")
-        traceback.print_exc()
-        raise SystemExit(1)
-
-    last_config_path = project_root / args.last_month / "config" / "waiver_assumptions.yaml"
-    this_config_path = project_root / args.this_month / "config" / "waiver_assumptions.yaml"
-
-    print_section("CONFIG PATHS")
-    print("last_config_path:", last_config_path)
-    print("this_config_path:", this_config_path)
-    print("last exists     :", last_config_path.exists())
-    print("this exists     :", this_config_path.exists())
-
-    try:
-        config_last = load_monthly_config(str(last_config_path))
-        config_this = load_monthly_config(str(this_config_path))
-    except Exception as e:
-        print_section("CONFIG LOAD ERROR")
-        print("ERROR TYPE   :", type(e).__name__)
-        print("ERROR MESSAGE:", str(e))
-        print("FULL TRACEBACK:")
-        traceback.print_exc()
-        raise SystemExit(1)
-
-    print_section("CONFIG VALUES")
-    print("LAST valuation_date:", config_last.get("valuation_date"))
-    print("THIS valuation_date:", config_this.get("valuation_date"))
-    print("LAST interest_rate :", config_last.get("interest_rate"))
-    print("THIS interest_rate :", config_this.get("interest_rate"))
-    print("LAST FX            :", config_last.get("usd_to_idr_rate"))
-    print("THIS FX            :", config_this.get("usd_to_idr_rate"))
-
-    if config_last.get("interest_rate") == config_this.get("interest_rate"):
-        print()
-        print("WARNING: LAST and THIS interest_rate are identical after config loading.")
-        print("If interest impact is zero, that would be expected.")
-    else:
-        print()
-        print("OK: LAST and THIS interest_rate are different after config loading.")
-
-    print_section("RESERVE ENGINE SIGNATURE")
-    sig = inspect.signature(calculate_waiver_reserve)
-    print("calculate_waiver_reserve signature:")
-    print(sig)
-
-    parameter_names = list(sig.parameters.keys())
-    print("parameters:", parameter_names)
-
-    if "interest_rates" not in parameter_names:
-        print()
-        print("PROBLEM FOUND:")
-        print("calculate_waiver_reserve() does NOT accept parameter 'interest_rates'.")
-        print("AOM cannot isolate interest rate impact until reserve_engine.py is updated.")
-        print()
-        print("Expected signature should include:")
-        print("    interest_rates=None, usd_to_idr_rate=None, valuation_date=None")
-        raise SystemExit(2)
-
-    print_section("LOAD LAST MONTH DATA")
-    try:
-        data_last = load_all_raw_data(config_last, "DEBUG_AOM_INTEREST")
-    except Exception as e:
-        print("ERROR TYPE   :", type(e).__name__)
-        print("ERROR MESSAGE:", str(e))
-        print("FULL TRACEBACK:")
-        traceback.print_exc()
-        raise SystemExit(1)
-
-    print("Loaded data keys:", list(data_last.keys()))
-
-    for key in ["masterpolis", "product_mapping", "urlsbinf", "crlsrinf", "waiver_dates", "mortality_table"]:
-        if key in data_last:
-            print(f"{key:20s}: rows={len(data_last[key])}, cols={len(data_last[key].columns)}")
+    for reserve_col_name, df in scenario_outputs.items():
+        scenario_df = _scenario_to_policy_reserve(df, reserve_col_name)
+        if merged is None:
+            merged = scenario_df
         else:
-            print(f"{key:20s}: MISSING")
+            merged = merged.merge(scenario_df, on="policy_number", how="outer")
 
-    print_section("RUN SCENARIO: RESERVE LAST MONTH")
-    try:
-        reserve_last = calculate_waiver_reserve(
-            data=data_last,
-            config=config_last,
-            scenario_name="reserve_last_month",
-        )
-    except Exception as e:
-        print("ERROR TYPE   :", type(e).__name__)
-        print("ERROR MESSAGE:", str(e))
-        print("FULL TRACEBACK:")
-        traceback.print_exc()
-        raise SystemExit(1)
+    if merged is None:
+        merged = pd.DataFrame(columns=["policy_number"])
 
-    print("reserve_last rows:", len(reserve_last))
-    print("reserve_last columns:", list(reserve_last.columns))
-    print("reserve_last total:", safe_sum(reserve_last, "waiver_reserve_idr"))
+    for reserve_col_name in scenario_outputs.keys():
+        if reserve_col_name not in merged.columns:
+            merged[reserve_col_name] = 0.0
+        merged[reserve_col_name] = merged[reserve_col_name].fillna(0.0)
 
-    if "Currency" in reserve_last.columns and "waiver_reserve_idr" in reserve_last.columns:
-        print()
-        print("reserve_last by Currency:")
-        print(reserve_last.groupby("Currency")["waiver_reserve_idr"].sum())
+        flag_col = f"has_{reserve_col_name}"
+        if flag_col not in merged.columns:
+            merged[flag_col] = False
+        merged[flag_col] = merged[flag_col].fillna(False).astype(bool)
 
-    for col in ["interest_rate_idr_used", "interest_rate_usd_used", "usd_to_idr_rate_used", "valuation_date_used"]:
-        if col in reserve_last.columns:
-            print(f"{col}: {reserve_last[col].drop_duplicates().head(10).tolist()}")
+    dims = _build_policy_dimensions(scenario_outputs)
+    merged = merged.merge(dims, on="policy_number", how="left")
+    for col in PRODUCT_DIMENSIONS:
+        if col not in merged.columns:
+            merged[col] = "UNMAPPED"
+        merged[col] = merged[col].fillna("UNMAPPED").astype(str).str.strip()
+        merged.loc[merged[col].eq(""), col] = "UNMAPPED"
 
-    print_section("RUN SCENARIO: RESERVE AFTER INTEREST")
-    try:
-        reserve_after_interest = calculate_waiver_reserve(
-            data=data_last,
-            config=config_last,
-            scenario_name="reserve_after_interest_rate",
-            interest_rates=config_this["interest_rate"],
-        )
-    except Exception as e:
-        print("ERROR TYPE   :", type(e).__name__)
-        print("ERROR MESSAGE:", str(e))
-        print("FULL TRACEBACK:")
-        traceback.print_exc()
-        raise SystemExit(1)
+    return merged
 
-    print("reserve_after_interest rows:", len(reserve_after_interest))
-    print("reserve_after_interest total:", safe_sum(reserve_after_interest, "waiver_reserve_idr"))
 
-    if "Currency" in reserve_after_interest.columns and "waiver_reserve_idr" in reserve_after_interest.columns:
-        print()
-        print("reserve_after_interest by Currency:")
-        print(reserve_after_interest.groupby("Currency")["waiver_reserve_idr"].sum())
+def _assign_policy_status(row: pd.Series) -> str:
+    """Assign AOM policy status based on policy presence in opening and closing scenario."""
+    in_last = bool(row.get("has_reserve_last_month", False))
+    in_this = bool(row.get("has_reserve_this_month", False))
 
-    for col in ["interest_rate_idr_used", "interest_rate_usd_used", "usd_to_idr_rate_used", "valuation_date_used"]:
-        if col in reserve_after_interest.columns:
-            print(f"{col}: {reserve_after_interest[col].drop_duplicates().head(10).tolist()}")
+    if in_last and in_this:
+        return "Continuing Policies"
+    if not in_last and in_this:
+        return "New Policies"
+    if in_last and not in_this:
+        return "Terminated Policies"
+    return "Bridge Only"
 
-    print_section("COMPARE LAST VS AFTER INTEREST")
 
-    required_cols = ["policy_number", "waiver_reserve_idr"]
-    missing_last = [c for c in required_cols if c not in reserve_last.columns]
-    missing_after = [c for c in required_cols if c not in reserve_after_interest.columns]
+def build_movement_table(
+    scenario_outputs: Dict[str, pd.DataFrame],
+    run_id: str,
+    config_last: Dict[str, Any],
+    config_this: Dict[str, Any],
+    tolerance: float = 1.0,
+) -> pd.DataFrame:
+    """Build per-policy movement table and perform reconciliation checks."""
+    logger.info("=== BOTTOM: Build per-policy AOM table ===")
+    df = _merge_scenarios(scenario_outputs)
 
-    if missing_last or missing_after:
-        print("Cannot compare because required columns are missing.")
-        print("missing in reserve_last:", missing_last)
-        print("missing in reserve_after_interest:", missing_after)
-        raise SystemExit(3)
+    df["status"] = df.apply(_assign_policy_status, axis=1)
 
-    left_cols = ["policy_number", "waiver_reserve_idr"]
-    right_cols = ["policy_number", "waiver_reserve_idr"]
+    df["interest_rate_impact"] = df["reserve_after_interest_rate"] - df["reserve_last_month"]
+    df["fx_rate_impact"] = df["reserve_after_fx_rate"] - df["reserve_after_interest_rate"]
+    df["aging_impact"] = df["reserve_after_aging"] - df["reserve_after_fx_rate"]
 
-    optional_cols = ["Currency", "annuity_factor", "annual_premium_waived"]
-    for col in optional_cols:
-        if col in reserve_last.columns:
-            left_cols.append(col)
-        if col in reserve_after_interest.columns:
-            right_cols.append(col)
+    # Natural Impact replaces the old generic Portfolio Impact.
+    # It explains the bridge from aged last-month portfolio to actual this-month portfolio.
+    df["natural_impact_new"] = 0.0
+    df["natural_impact_terminated"] = 0.0
+    df["natural_impact_continuing"] = 0.0
 
-    debug = reserve_last[left_cols].merge(
-        reserve_after_interest[right_cols],
-        on="policy_number",
-        how="inner",
-        suffixes=("_last", "_after_interest"),
+    df.loc[
+        df["status"] == "New Policies",
+        "natural_impact_new",
+    ] = df["reserve_this_month"]
+
+    df.loc[
+        df["status"] == "Terminated Policies",
+        "natural_impact_terminated",
+    ] = -df["reserve_after_aging"]
+
+    df.loc[
+        df["status"] == "Continuing Policies",
+        "natural_impact_continuing",
+    ] = df["reserve_this_month"] - df["reserve_after_aging"]
+
+    df["natural_impact_total"] = (
+        df["natural_impact_new"]
+        + df["natural_impact_terminated"]
+        + df["natural_impact_continuing"]
     )
 
-    debug["reserve_diff"] = (
-        debug["waiver_reserve_idr_after_interest"]
-        - debug["waiver_reserve_idr_last"]
+    # Backward-compatible alias. Do not show this in the main final report.
+    df["portfolio_impact"] = df["natural_impact_total"]
+
+    df["total_impact"] = df["reserve_this_month"] - df["reserve_last_month"]
+    df["explained_impact"] = (
+        df["interest_rate_impact"]
+        + df["fx_rate_impact"]
+        + df["aging_impact"]
+        + df["natural_impact_total"]
+    )
+    df["reconciliation_diff"] = df["total_impact"] - df["explained_impact"]
+
+    df["run_id"] = run_id
+    df["last_valuation_date"] = config_last.get("valuation_date")
+    df["this_valuation_date"] = config_this.get("valuation_date")
+    df["last_config_path"] = config_last.get("_config_path")
+    df["this_config_path"] = config_this.get("_config_path")
+    df["calculation_timestamp"] = datetime.now()
+
+    assert_max_abs_column(df, "reconciliation_diff", tolerance, "Per-policy AOM reconciliation")
+
+    display_cols = [
+        "policy_number",
+        "Company",
+        "Prod_Name",
+        "Plan_Code",
+        "status",
+        "reserve_last_month",
+        "interest_rate_impact",
+        "fx_rate_impact",
+        "aging_impact",
+        "natural_impact_new",
+        "natural_impact_terminated",
+        "natural_impact_continuing",
+        "natural_impact_total",
+        "total_impact",
+        "reserve_this_month",
+        "reserve_after_interest_rate",
+        "reserve_after_fx_rate",
+        "reserve_after_aging",
+        "explained_impact",
+        "reconciliation_diff",
+        "run_id",
+        "last_valuation_date",
+        "this_valuation_date",
+        "last_config_path",
+        "this_config_path",
+        "calculation_timestamp",
+    ]
+
+    return df[display_cols].sort_values(["Company", "Prod_Name", "policy_number"]).reset_index(drop=True)
+
+
+def build_scenario_totals(scenario_outputs: Dict[str, pd.DataFrame]) -> pd.DataFrame:
+    """Build scenario-level reserve totals for audit."""
+    rows = []
+    for scenario_name, df in scenario_outputs.items():
+        rows.append(
+            {
+                "scenario": scenario_name,
+                "policy_count": len(df),
+                "reserve_total_idr": float(df["waiver_reserve_idr"].sum()) if "waiver_reserve_idr" in df.columns else 0.0,
+                "annual_premium_waived_idr_total": float(df["annual_premium_waived_idr"].sum()) if "annual_premium_waived_idr" in df.columns else None,
+                "annual_premium_waived_ccy_total": float(df["annual_premium_waived_ccy"].sum()) if "annual_premium_waived_ccy" in df.columns else None,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def build_aom_summary_by_product(movement: pd.DataFrame) -> pd.DataFrame:
+    """Aggregate AOM bridge by Company, Prod_Name, and Plan_Code."""
+    numeric_cols = [
+        "reserve_last_month",
+        "interest_rate_impact",
+        "fx_rate_impact",
+        "aging_impact",
+        "natural_impact_new",
+        "natural_impact_terminated",
+        "natural_impact_continuing",
+        "natural_impact_total",
+        "total_impact",
+        "reserve_this_month",
+        "explained_impact",
+        "reconciliation_diff",
+    ]
+
+    return (
+        movement.groupby(PRODUCT_DIMENSIONS, dropna=False, as_index=False)
+        .agg(
+            policy_count=("policy_number", "nunique"),
+            **{col: (col, "sum") for col in numeric_cols},
+        )
+        .sort_values(["Company", "Prod_Name", "Plan_Code"])
+        .reset_index(drop=True)
     )
 
-    if "annuity_factor_last" in debug.columns and "annuity_factor_after_interest" in debug.columns:
-        debug["annuity_factor_diff"] = (
-            debug["annuity_factor_after_interest"]
-            - debug["annuity_factor_last"]
+
+def build_aom_summary_by_company(movement: pd.DataFrame) -> pd.DataFrame:
+    """Aggregate AOM bridge by Company."""
+    numeric_cols = [
+        "reserve_last_month",
+        "interest_rate_impact",
+        "fx_rate_impact",
+        "aging_impact",
+        "natural_impact_new",
+        "natural_impact_terminated",
+        "natural_impact_continuing",
+        "natural_impact_total",
+        "total_impact",
+        "reserve_this_month",
+        "explained_impact",
+        "reconciliation_diff",
+    ]
+
+    return (
+        movement.groupby(["Company"], dropna=False, as_index=False)
+        .agg(
+            policy_count=("policy_number", "nunique"),
+            **{col: (col, "sum") for col in numeric_cols},
         )
-    else:
-        debug["annuity_factor_diff"] = 0
+        .sort_values("Company")
+        .reset_index(drop=True)
+    )
 
-    print("merged rows:", len(debug))
-    print("total reserve last          :", debug["waiver_reserve_idr_last"].sum())
-    print("total reserve after interest:", debug["waiver_reserve_idr_after_interest"].sum())
-    print("total interest impact       :", debug["reserve_diff"].sum())
-    print("total annuity factor diff   :", debug["annuity_factor_diff"].sum())
 
-    currency_col = None
-    if "Currency_last" in debug.columns:
-        currency_col = "Currency_last"
-    elif "Currency_after_interest" in debug.columns:
-        currency_col = "Currency_after_interest"
+def run_analysis_of_movement(
+    config_last_path: str | Path,
+    config_this_path: str | Path,
+    tolerance: float = 1.0,
+    output_path: str | Path | None = None,
+) -> Path:
+    """
+    Run full waiver AOM process.
 
-    if currency_col is not None:
-        print()
-        print("Impact by Currency:")
-        print(
-            debug.groupby(currency_col)[["reserve_diff", "annuity_factor_diff"]]
-            .sum()
-            .sort_index()
+    Returns exported Excel path.
+    """
+    config_last = load_monthly_config(config_last_path)
+    config_this = load_monthly_config(config_this_path)
+
+    run_id = make_run_id("WAIVER_AOM", config_this.get("_valuation_month", "UNKNOWN"))
+    setup_logging(config_this["output_dir"], run_id)
+
+    logger.info("AOM last config: %s", config_last["_config_path"])
+    logger.info("AOM this config: %s", config_this["_config_path"])
+
+    data_last = load_all_raw_data(config_last, run_id=f"{run_id}_LAST")
+    data_this = load_all_raw_data(config_this, run_id=f"{run_id}_THIS")
+
+    # Scenario 0: Opening reserve, last-month everything.
+    reserve_last = calculate_waiver_reserve(
+        data=data_last,
+        config=config_last,
+        run_id=run_id,
+        scenario_name="reserve_last_month",
+    )
+
+    # Scenario 1: Change discount rates only, on last-month portfolio and last valuation date.
+    reserve_after_interest = calculate_waiver_reserve(
+        data=data_last,
+        config=config_last,
+        run_id=run_id,
+        scenario_name="reserve_after_interest_rate",
+        interest_rates=config_this.get("interest_rate"),
+        yield_curve=data_this.get("ifrs17_yield_curve"),
+    )
+
+    # Scenario 2: Change FX after discount rates, still last-month portfolio and last valuation date.
+    reserve_after_fx = calculate_waiver_reserve(
+        data=data_last,
+        config=config_last,
+        run_id=run_id,
+        scenario_name="reserve_after_fx_rate",
+        interest_rates=config_this.get("interest_rate"),
+        usd_to_idr_rate=config_this.get("usd_to_idr_rate"),
+        yield_curve=data_this.get("ifrs17_yield_curve"),
+    )
+
+    # Scenario 3: Change valuation date / aging, still last-month portfolio.
+    reserve_after_aging = calculate_waiver_reserve(
+        data=data_last,
+        config=config_last,
+        run_id=run_id,
+        scenario_name="reserve_after_aging",
+        interest_rates=config_this.get("interest_rate"),
+        usd_to_idr_rate=config_this.get("usd_to_idr_rate"),
+        valuation_date=config_this.get("valuation_date"),
+        yield_curve=data_this.get("ifrs17_yield_curve"),
+    )
+
+    # Scenario 4: Closing reserve, this-month everything.
+    reserve_this = calculate_waiver_reserve(
+        data=data_this,
+        config=config_this,
+        run_id=run_id,
+        scenario_name="reserve_this_month",
+    )
+
+    scenario_outputs = {
+        "reserve_last_month": reserve_last,
+        "reserve_after_interest_rate": reserve_after_interest,
+        "reserve_after_fx_rate": reserve_after_fx,
+        "reserve_after_aging": reserve_after_aging,
+        "reserve_this_month": reserve_this,
+    }
+
+    movement = build_movement_table(
+        scenario_outputs=scenario_outputs,
+        run_id=run_id,
+        config_last=config_last,
+        config_this=config_this,
+        tolerance=tolerance,
+    )
+
+    numeric_cols = [
+        "reserve_last_month",
+        "interest_rate_impact",
+        "fx_rate_impact",
+        "aging_impact",
+        "natural_impact_new",
+        "natural_impact_terminated",
+        "natural_impact_continuing",
+        "natural_impact_total",
+        "total_impact",
+        "reserve_this_month",
+        "explained_impact",
+        "reconciliation_diff",
+    ]
+    summary = summarize_numeric_columns(movement, numeric_cols)
+    summary.insert(0, "run_id", run_id)
+
+    status_summary = (
+        movement.groupby("status", as_index=False)
+        .agg(
+            policy_count=("policy_number", "count"),
+            reserve_last_month=("reserve_last_month", "sum"),
+            interest_rate_impact=("interest_rate_impact", "sum"),
+            fx_rate_impact=("fx_rate_impact", "sum"),
+            aging_impact=("aging_impact", "sum"),
+            natural_impact_new=("natural_impact_new", "sum"),
+            natural_impact_terminated=("natural_impact_terminated", "sum"),
+            natural_impact_continuing=("natural_impact_continuing", "sum"),
+            natural_impact_total=("natural_impact_total", "sum"),
+            reserve_this_month=("reserve_this_month", "sum"),
+            total_impact=("total_impact", "sum"),
+            reconciliation_diff=("reconciliation_diff", "sum"),
         )
+        .sort_values("status")
+    )
 
-    non_zero = debug[debug["reserve_diff"].abs() > 0.01].copy()
+    scenario_totals = build_scenario_totals(scenario_outputs)
+    summary_by_product = build_aom_summary_by_product(movement)
+    summary_by_company = build_aom_summary_by_company(movement)
 
-    print()
-    print("non-zero reserve_diff rows:", len(non_zero))
+    if output_path is None:
+        output_path = Path(config_this["output_dir"]) / f"Waiver_AOM_{config_this['_valuation_month']}_{run_id}.xlsx"
 
-    print()
-    print("Sample non-zero rows:")
-    sample_cols = ["policy_number", "reserve_diff"]
-    for c in [
-        "Currency_last",
-        "Currency_after_interest",
-        "annuity_factor_last",
-        "annuity_factor_after_interest",
-        "annuity_factor_diff",
-        "waiver_reserve_idr_last",
-        "waiver_reserve_idr_after_interest",
-        "annual_premium_waived_last",
-        "annual_premium_waived_after_interest",
-    ]:
-        if c in debug.columns:
-            sample_cols.append(c)
+    exported_path = export_excel(
+        output_path=output_path,
+        sheets={
+            "Movement_Per_Policy": movement,
+            "Summary": summary,
+            "Summary_By_Product": summary_by_product,
+            "Summary_By_Company": summary_by_company,
+            "Scenario_Totals": scenario_totals,
+            "Status_Summary": status_summary,
+        },
+    )
 
-    if len(non_zero) > 0:
-        print(non_zero[sample_cols].head(30).to_string(index=False))
-    else:
-        print("No non-zero interest impact detected.")
-
-    print_section("DIAGNOSIS")
-    total_abs_impact = debug["reserve_diff"].abs().sum()
-
-    if total_abs_impact == 0:
-        print("RESULT: Interest override did NOT change reserve at policy level.")
-        print()
-        print("Most likely causes:")
-        print("1. reserve_engine.py receives interest_rates but does not pass scenario_config to calculate_annuity_factor().")
-        print("2. model.py reads the wrong config key, e.g. 'interest_rates' instead of 'interest_rate'.")
-        print("3. model.py ignores config interest_rate and uses a hardcoded/default rate.")
-        print("4. Currency values do not match interest rate keys and code silently falls back to default rate.")
-        print()
-        print("Next file to inspect: src/waiver_reserve/reserve_engine.py and src/waiver_reserve/model.py")
-    else:
-        print("RESULT: Interest override DOES change reserve at policy level.")
-        print()
-        print("Therefore if AOM output still shows interest_rate_impact = 0,")
-        print("the bug is likely in aom.py movement formula, scenario merge, or summary aggregation.")
-        print()
-        print("Next file to inspect: src/waiver_reserve/aom.py")
-
-    print()
-    print("Debug completed.")
-
-
-if __name__ == "__main__":
-    main()
+    logger.info("AOM completed successfully. Output: %s", exported_path)
+    return exported_path
